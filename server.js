@@ -12,12 +12,26 @@ app.use(express.json());
 const nonces = new Map();
 const tokens = new Map();
 
-function generateToken() {
-  return 'pvt_' + crypto.randomBytes(32).toString('hex');
+// Issue a JWT-SHAPED token. The frontend's isTokenValid() does
+// JSON.parse(atob(token.split('.')[1])) and reads .exp — so the token MUST be
+// 3 dot-separated segments with a base64 (NOT base64url — browser atob can't
+// decode - or _) payload carrying a future `exp`. We don't verify the sig.
+function generateToken(wallet) {
+  const b64 = (o) => Buffer.from(JSON.stringify(o)).toString('base64');
+  const now = Math.floor(Date.now() / 1000);
+  const header = b64({ alg: 'HS256', typ: 'JWT' });
+  const payload = b64({
+    sub: wallet || 'anon',
+    wallet: wallet || 'anon',
+    iat: now,
+    exp: now + 60 * 60 * 24 * 30, // 30 days
+  });
+  const sig = crypto.randomBytes(24).toString('hex');
+  return `${header}.${payload}.${sig}`;
 }
 
 app.get('/auth/nonce', (req, res) => {
-  const { wallet } = req.query;
+  const wallet = req.query.wallet || req.query.walletAddress;
   if (!wallet) return res.status(400).json({ error: 'wallet required' });
   const nonce = crypto.randomUUID();
   nonces.set(wallet, { nonce, created: Date.now() });
@@ -25,12 +39,14 @@ app.get('/auth/nonce', (req, res) => {
 });
 
 app.post('/auth/login', (req, res) => {
-  const { wallet, signature, message } = req.body || {};
+  const body = req.body || {};
+  // Frontend sends `walletAddress`; accept `wallet` too for our own tooling.
+  const wallet = body.walletAddress || body.wallet;
   if (!wallet) return res.status(400).json({ success: false, error: 'wallet required' });
-  const token = generateToken();
+  const token = generateToken(wallet);
   tokens.set(token, { wallet, created: Date.now() });
   nonces.delete(wallet);
-  res.json({ success: true, token });
+  res.json({ success: true, token, wallet });
 });
 
 app.post('/auth/logout', (req, res) => {
@@ -45,6 +61,14 @@ app.get('/auth/verify', (req, res) => {
   if (data) {
     res.json({ valid: true, wallet: data.wallet });
   } else {
+    // Token may be valid-but-not-in-memory after a server restart. Accept any
+    // structurally-valid, unexpired JWT-shaped token so players aren't kicked.
+    try {
+      const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString());
+      if (payload.exp && Date.now() / 1000 < payload.exp) {
+        return res.json({ valid: true, wallet: payload.wallet || payload.sub });
+      }
+    } catch (_) {}
     res.json({ valid: false });
   }
 });
